@@ -1,0 +1,407 @@
+---
+title: "Prevendo Demanda Estoque"
+author: "Jefferson Navarausckas"
+date: "19/06/2019"
+output: pdf_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+1 - Carregando as bibliotecas necessarias
+
+```{r}
+library("data.table")
+library("dplyr")
+library("ggplot2")
+library("corrplot")
+library("caTools")
+library("neuralnet")
+```
+
+2 - Coleta de dados
+
+```{r}
+system.time(dados_cidades <- fread("town_state.csv"))
+system.time(dados_vendas <- fread("train.csv"))
+```
+
+3 - Analise exploratória inicial dos dados
+
+Como o volume de dados é muito grande para capacidade da minha maquina, utilizarei uma amostra desses dados, utilizando 500 mil observacoes.
+
+```{r}
+dados_vendas <- dados_vendas %>% 
+  sample_n(size = 500000)
+
+head(dados_vendas)
+head(dados_cidades)
+
+dim(dados_vendas)
+dim(dados_cidades)
+
+str(dados_vendas)
+str(dados_cidades)
+
+any(is.na(dados_vendas))
+any(is.na(dados_cidades))
+```
+
+4 - Analise, tratamento e transformacao dos dados
+
+# Alterando nome das variaveis
+```{r}
+colnames(dados_vendas) <- c('dia','loja','id_canal_venda','id_rota','id_cliente','id_produto','unidade_venda','valor_venda','unidade_dev_next_week','valor_dev_next_week','demanda_ajustada')
+colnames(dados_cidades) <- c('loja','cidade','estado')
+```
+
+# Incluindo uma coluna com os dias da semana e criando os fatores dos mesmos. Apos a criação dos fatores verificamos se há valores NA no dataset
+
+```{r}
+dados_vendas$dia_semana = sapply(dados_vendas$dia, function(x){
+  ifelse(x == 3 , "Quinta", 
+         ifelse(x == 4 , "Sexta",
+                ifelse(x == 5 , "Sabado",
+                       ifelse(x == 6 , "Domingo",
+                              ifelse(x == 7 , "Segunda",
+                                     ifelse(x == 8 , "Terca","Quarta"))))))})
+
+dados_vendas$dia_semana <- factor(dados_vendas$dia_semana, levels = c("Quinta", "Sexta", "Sabado", "Domingo","Segunda","Terca","Quarta"), labels = c("Quinta", "Sexta", "Sabado", "Domingo","Segunda","Terca","Quarta"))
+
+any(is.na(dados_vendas))
+```
+
+# Medidas de Tendência Central das variáveis numericas. Com base nesta analise identificamos que os valores da media e mediana estao muito distantes e tambem a diferenca entre o 3 quartil e o valor maximo.
+
+```{r}
+summary(dados_vendas$unidade_venda)
+summary(dados_vendas$unidade_dev_next_week)
+summary(dados_vendas$demanda_ajustada)
+```
+
+# Analisando Quantil e Percentil das variaveis
+
+```{r}
+quantil_vd <- quantile(dados_vendas$unidade_venda)
+quantil_dv <- quantile(dados_vendas$unidade_dev_next_week)
+quantil_da <- quantile(dados_vendas$demanda_ajustada)
+
+quantile(dados_vendas$unidade_venda, probs = c(0.01, 0.99))
+quantile(dados_vendas$unidade_venda, seq( from = 0, to = 1, by = 0.10))
+
+quantile(dados_vendas$unidade_dev_next_week, probs = c(0.01, 0.99))
+quantile(dados_vendas$unidade_dev_next_week, seq( from = 0, to = 1, by = 0.10))
+
+quantile(dados_vendas$demanda_ajustada, probs = c(0.01, 0.99))
+quantile(dados_vendas$demanda_ajustada, seq( from = 0, to = 1, by = 0.10))
+```
+
+#Analisando a diferença entre Q3 e Q1
+
+```{r}
+IQR(dados_vendas$unidade_venda) 
+IQR(dados_vendas$unidade_dev_next_week) 
+IQR(dados_vendas$demanda_ajustada) 
+```
+
+# Verificando outliers abaixo e acima
+# Abaixo utilizaremos a formula Q1 - 1,5 * IQR
+# Acima utilizaremos a formula Q3 + 1,5 * IQR
+
+```{r}
+quantil_vd[[2]] - (1.5 * IQR(dados_vendas$unidade_venda))
+quantil_dv[[2]] - (1.5 * IQR(dados_vendas$unidade_dev_next_week))
+quantil_da[[2]] - (1.5 * IQR(dados_vendas$demanda_ajustada))
+
+quantil_vd[[4]] + (1.5 * IQR(dados_vendas$unidade_venda))
+quantil_dv[[4]] + (1.5 * IQR(dados_vendas$unidade_dev_next_week))
+quantil_da[[4]] + (1.5 * IQR(dados_vendas$demanda_ajustada))
+```
+
+# Analisando desvio padrao
+
+```{r}
+sd(dados_vendas$unidade_venda)
+sd(dados_vendas$unidade_dev_next_week)
+sd(dados_vendas$demanda_ajustada)
+```
+
+# Criando Boxplot
+# Observe que pelo boxplot podemos identificar muitos outiers
+# Leitura de Baixo para Cima - Q1, Q2 (Mediana) e Q3
+
+```{r}
+boxplot(dados_vendas$unidade_venda, main = "Boxplot Vendas", ylab = "QT Vendas")
+boxplot(dados_vendas$unidade_dev_next_week, main = "Boxplot Devolucao", ylab = "QT Devolucao")
+boxplot(dados_vendas$demanda_ajustada, main = "Boxplot Demanda Ajustada", ylab = "Dem Ajustada")
+```
+
+# Criando um modelo SEM tratar nenhuma variavel para avaliar a acuracia antes e depois do tratamento das variaveis.
+# Podemos observar que a acuracia do modelo foi boa, porem há muitos graus de liberdade e muitos outliers nesses dados que ainda nao foram tratados o que pode prejudicar a generalizacao do modelo.
+
+```{r}
+modelo_lm_v1 <- lm(demanda_ajustada ~. , data = dados_vendas)
+modelo_lm_v2 <- lm(demanda_ajustada ~ dia + unidade_venda + id_produto + valor_venda + unidade_dev_next_week + valor_dev_next_week, data = dados_vendas)
+modelo_lm_v3 <- lm(demanda_ajustada ~ dia + unidade_venda + valor_venda + unidade_dev_next_week + valor_dev_next_week + id_rota + id_canal_venda, data = dados_vendas)
+
+summary(modelo_lm_v1)
+summary(modelo_lm_v2)
+summary(modelo_lm_v3)
+```
+
+# Obtendo os resíduos do modelo 2 que foi criado, convertendo para um Dataframe e gerando um histograma destes residuos.
+
+```{r}
+res <- residuals(modelo_lm_v2)
+res <- as.data.frame(res)
+
+ggplot(res, aes(res)) +  
+  geom_histogram(fill = 'blue', 
+                 alpha = 0.5, 
+                 binwidth = 1)
+```
+
+# Tratando os valores outliers
+# Vou retirar do conjunto de dados valores com unidade de venda superiores a 12 e demanda superiores a 12 conforme avaliado anteriormente na analise dos quartis.
+# Apos retirada desses outliers ficamos com 443.750 observacoes no dataset
+
+```{r}
+dados_vendas <- dados_vendas %>%
+                  filter(unidade_venda <= 12)
+
+dados_vendas <- dados_vendas %>%
+  filter(demanda_ajustada <= 12)
+```
+
+# Avaliando novamente as Medias de Tendência Central das variáveis. 
+# Agora podemos observar que os dados de media e mediana sao proximos e o desvio padrão NÃO é alto.
+
+```{r}
+summary(dados_vendas$demanda_ajustada)
+summary(dados_vendas$unidade_venda)
+summary(dados_vendas$unidade_dev_next_week)
+
+sd(dados_vendas$unidade_venda)
+sd(dados_vendas$unidade_dev_next_week)
+sd(dados_vendas$demanda_ajustada)
+```
+
+# Criando um histograma para a variavel target
+
+```{r}
+ggplot(dados_vendas, aes(x = demanda_ajustada)) + 
+  geom_histogram(bins = 20, 
+                 alpha = 0.5, fill = 'blue') + 
+  theme_minimal()
+```
+
+# Analisando a correlacao das variaveis
+# Definindo as colunas para a análise de correlação e criando um coorplot
+
+```{r}
+cols <- c("unidade_venda", "unidade_dev_next_week", "valor_venda" ,"valor_dev_next_week","demanda_ajustada","dia")
+correlacao <- cor(dados_vendas[,cols])
+
+corrplot(correlacao, method = 'color')
+```
+
+# Gerando alguns graficos para insights dos gestores
+
+```{r}
+dados_vendas %>%
+  group_by(dia_semana) %>%
+  summarise(unidade_venda = sum(unidade_venda),
+            unidade_dev_next_week = sum(unidade_dev_next_week))%>%
+  melt(id = c("dia_semana")) %>%
+  ggplot(aes(x = dia_semana, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position="dodge") + 
+  ylab("Quantidade") + 
+  labs(fill = "Tipo")
+  ggtitle("Quantidade Vendida x Devolvida")
+  
+  
+  dados_vendas %>%
+  inner_join(dados_cidades, by = 'loja') %>%
+  group_by(estado) %>%
+  select(estado, loja, unidade_venda) %>%
+  summarise(unidade_venda = sum(unidade_venda))%>%
+  ggplot(aes(x = reorder(estado, -unidade_venda), y = unidade_venda, fill = estado)) +
+  geom_bar(stat = "identity", position="dodge") +
+  guides(fill = FALSE) +
+  xlab("Estado") +
+  ylab("QT Venda") +
+  ggtitle("Vendas por estado") +
+  theme(axis.text = element_text(angle = 90))
+  
+  
+  dados_vendas %>%
+  inner_join(dados_cidades, by = 'loja') %>%
+  group_by(estado) %>%
+  select(estado, loja, valor_venda) %>%
+  summarise(valor_venda = sum(valor_venda))%>%
+  ggplot(aes(x = reorder(estado, -valor_venda), y = valor_venda, fill = estado)) +
+  geom_bar(stat = "identity", position="dodge") +
+  guides(fill = FALSE) +
+  xlab("Estado") +
+  ylab("Faturamento") +
+  ggtitle("Faturamento por estado") +
+  theme(axis.text = element_text(angle = 90))
+  
+```
+
+
+4 - Criando e avaliando os modelos preditivos
+
+# Criando dados de treino e de teste (70% e 30% respectivamente)
+
+```{r}
+amostra <- sample.split(dados_vendas$demanda_ajustada, SplitRatio = 0.70)
+treino = subset(dados_vendas, amostra == TRUE)
+teste = subset(dados_vendas, amostra == FALSE)
+```
+
+# Modelo LM Em torno de 98% de acuracia
+
+```{r}
+modelo_lm <- lm(demanda_ajustada ~ dia + unidade_venda + valor_venda + unidade_dev_next_week + valor_dev_next_week, data = dados_vendas)
+
+summary(modelo_lm)
+
+previsao_lm <- predict(modelo_lm, teste)
+```
+
+# Visualizando os valores previstos e observados, tratando valores negativos e gerando um gráfico parademonstrar a quantidade de erros e acertos do modelo.
+
+```{r}
+resultados <- cbind(teste$demanda_ajustada,round(previsao_lm)) 
+colnames(resultados) <- c('Real','Previsto')
+resultados <- as.data.frame(resultados)
+
+trata_zero <- function(x){
+  if  (x < 0){
+    return(0)
+  }else{
+    return(x)
+  }
+}
+
+resultados$Previsto <- sapply(resultados$Previsto, trata_zero)
+
+func <- function(x , y){
+  if(x == y){
+    "ACERTO"
+  }else{
+    "ERRO"
+  }}
+
+resultados$tipo = mapply(func,resultados$Real,resultados$Previsto)
+
+resultados %>% 
+  group_by(tipo) %>%
+  summarise(total = n()) %>%
+  ggplot(aes(x = tipo, y = total, fill = tipo)) +
+  geom_bar(stat = "identity", position="dodge") +
+  geom_text(aes(label = total)) +
+  guides(fill = FALSE) +
+  ylab("QT Observacoes") +
+  ggtitle("Erros x Acertos do Modelo")
+```
+
+# Modelo de Rede Neural com 100% de acerto
+
+# Como esse modelo é muito pesado, iremos utilizar somente 30 registros
+```{r}
+dados_vendas <- dados_vendas %>% 
+  sample_n(size = 30000)
+```
+
+# Obtendo os valores minimos e maximos do dataset e normalizando as variaveis preditoras
+
+```{r}
+maxs <- apply(dados_vendas[, cols], 2, max) 
+mins <- apply(dados_vendas[, cols], 2, min)
+
+dados_normalizados <- dados_vendas
+
+dados_normalizados[, cols] <- as.data.frame(scale(dados_vendas[, cols], center = mins, scale = maxs - mins))
+
+```
+
+# Gerando dados de treino e teste
+```{r}
+amostra <- sample.split(dados_normalizados$demanda_ajustada, SplitRatio = 0.70)
+treino = subset(dados_normalizados, amostra == TRUE)
+teste = subset(dados_normalizados, amostra == FALSE)
+```
+
+# Criando uma formula e o modelo da rede neural
+```{r}
+formula = "demanda_ajustada ~ dia + unidade_venda + valor_venda + unidade_dev_next_week + valor_dev_next_week"
+
+modelo_rede_neural <- neuralnet(formula, data = treino, hidden = c(5,3), linear.output = TRUE)
+
+```
+
+# Fazendo as previsoes com os dados de teste
+```{r}
+previsoes_rn <- compute(modelo_rede_neural, teste)
+```
+
+
+# Convertendo os dados normalizados para numeros normais
+```{r}
+previsoes_rn <- previsoes_rn$net.result * (max(dados_vendas$demanda_ajustada) - min(dados_vendas$demanda_ajustada)) + min(dados_vendas$demanda_ajustada)
+dados_teste_convertidos <- (teste$demanda_ajustada) * (max(dados_vendas$demanda_ajustada) - min(dados_vendas$demanda_ajustada)) + min(dados_vendas$demanda_ajustada)
+
+```
+
+# Visualizando os dados previstos e reais e tratando valores zerados
+
+```{r}
+resultados <- cbind(dados_teste_convertidos,round(previsoes_rn)) 
+colnames(resultados) <- c('Real','Previsto')
+resultados <- as.data.frame(resultados)
+
+resultados$Previsto <- sapply(resultados$Previsto, trata_zero)
+
+```
+
+# Calculando a Taxa de Acuracia e Taxa de Erro
+
+```{r}
+
+MSE.nn <- sum((dados_teste_convertidos - previsoes_rn)^2)/nrow(teste)
+MSE.nn
+
+error.df <- data.frame(dados_teste_convertidos, previsoes_rn)
+head(error.df)
+
+SSE = sum((resultados$Previsto - resultados$Real)^2)
+SST = sum((mean(dados_vendas$demanda_ajustada) - resultados$Real)^2)
+
+R2 = 1 - (SSE/SST)
+R2
+
+library(ggplot2)
+ggplot(error.df, aes(x = dados_teste_convertidos,y = previsoes_rn)) + 
+  geom_point() + stat_smooth()
+
+```
+
+# Exibindo Gráfico com Erros x Acertos
+
+```{r}
+resultados$tipo = mapply(func,resultados$Real,resultados$Previsto)
+
+resultados %>% 
+  group_by(tipo) %>%
+  summarise(total = n()) %>%
+  ggplot(aes(x = tipo, y = total, fill = tipo)) +
+  geom_bar(stat = "identity", position="dodge") +
+  geom_text(aes(label = total)) +
+  guides(fill = FALSE) +
+  ylab("QT Observacoes") +
+  ggtitle("Erros x Acertos do Modelo - 98% de Acertos")
+```
+
